@@ -14,7 +14,13 @@
 #include "debug_print.h"
 #include <Adafruit_NeoPixel.h>
 #include <Servo.h>
+#include <EasyButton.h>
+#include <vector>
+#include <forward_list>
+#include <movingAvg.h>                  // https://github.com/JChristensen/movingAvg
+#include <EEPROM.h>
 
+//-------------------- HW PIN ASSIGNMENTS --------------------
 
 #define SERVO_PIN      D1
 #define SQUIRT_PIN     D2
@@ -23,18 +29,40 @@
 #define PIR_IN_PIN     D6
 #define POT_IN_PIN     A0
 
-Adafruit_NeoPixel pixel_33(2 /*NUMPIXELS*/, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+//-------------------- BUTTON SUPPORT --------------------
+EasyButton litButton(BUTTON_IN_PIN);
+
+//-------------------- SERVO SUPPORT --------------------
+Servo spraySweep;
+#define STEP_DELAY 2000
+
+int sweepMaxPos=180;
+int intraStepDelayMillis = 1;
+
+//-------------------- NEOPIXEL SUPPORT --------------------
+#define PIXELS_IN_USE 2
+
+Adafruit_NeoPixel pxl(PIXELS_IN_USE, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 #define pixelButton     0
 #define pixelExternal   1
-
-Servo spraySweep;
 
 
 #define RGB_BRIGHTNESS 64 // Change white brightness (max 255)
 
-// Defaults from running it!
-//  RGB_BUILTIN is 30,   RGB_BRIGHTNESS is 64
+typedef struct {
+    uint32_t color0;
+    uint32_t color1;
+    uint32_t durationMillis;
+    uint8_t pixelSelect;
+    uint8_t flashes;
+    uint8_t current_color;    // always 0 (color0) or 1 (color1)
+    uint32_t nextChangeMillis;
+} PixelFlashEvent_t;
+PixelFlashEvent_t pixelAction;
+#define PIXEL_TRIG_NOW 1
 
+// ht_state = RGB_BRIGHTNESS;
+uint8_t  bright_state = 64;
 
 #define RGB_FULL_BRIGHTNESS 255
 
@@ -57,44 +85,49 @@ Servo spraySweep;
 #define NeoSilver   0xC0C0C0
 #define NeoBrown    0x8B4513
 
-int sweepMaxPos=180;
- 
-#define STEP_DELAY 2000
 
-//uint8_t  brig
-//
-// ht_state = RGB_BRIGHTNESS;
-uint8_t  bright_state = 64;
+static uint32_t tick50=0;  // future:, tick128=0, tick10000=0, tick30000=0;
 
-int intraStepDelayMillis = 1;
 
-void setup() {
-  int potVal;
+void onLitButtonPressShortRelease(void)
+{
+  //lastActionMillis = millis();
+}
 
-  pinMode(NEOPIXEL_PIN, OUTPUT);
-  setPixelOuts(pixelExternal, NeoGreen, bright_state);
-  setPixelOuts(pixelButton, NeoWhite, bright_state);
-  pinMode(PIR_IN_PIN, INPUT);
+void onLitButtonPressLongRelease(void)
+{
+  //lastActionMillis = millis();
 
-  Serial.begin(115200);
-  delay(1500);  // // 400 required for ESP8266 "D1 Mini Pro"
+  if (!litButton.isPressed()) {
+  }
 
-  Serial.println("Cat Deterrent\n");
-  Serial.print("Maximum deflection readings: raw:");
-  potVal = analogRead(POT_IN_PIN);
-  Serial.print(potVal);
-  Serial.print(", Mapped degrees:");
-  sweepMaxPos = map(potVal, 0, 1023, 0, 179);
-  Serial.println(sweepMaxPos);
-
-  spraySweep.attach(SERVO_PIN,500,2400);
 }
 
 void setPixelOuts(int pixelID, uint32_t colorVar, int brightVar)
 {
-  pixel_33.setPixelColor(pixelID, colorVar);
-  pixel_33.setBrightness(brightVar);
-  pixel_33.show();
+  pxl.setPixelColor(pixelID, colorVar);
+  pxl.setBrightness(brightVar);
+  pxl.show();
+}
+
+void flash_pixel(uint8_t pixelSelect, uint32_t color0, uint8_t flashes, uint32_t duration, uint32_t color1)
+{
+    /* reference only
+        typedef struct {
+            uint32_t color0;
+            uint32_t color1;
+            uint32_t durationMillis;
+            uint8_t pixelSelect;
+            uint8_t flashes;
+            uint8_t current_color;    // always 0 (color0) or 1 (color1)
+            uint32_t nextChangeMillis;
+        } PixelFlashEvent_t;
+        std::forward_list<PixelFlashEvent_t> PixelFlashEvents {};
+    */
+
+    //PixelFlashEvents.push_front({color0, color1, pixelSelect, duration, flashes, NeoBlack, 1});
+    pixelAction = {color0, color1, duration, pixelSelect, flashes, NeoBlack, PIXEL_TRIG_NOW};
+    //dump_pixelAction("@instant: ", pixelAction);
 }
 
 void sweep(int passes)
@@ -132,11 +165,107 @@ void sweep(int passes)
     }
 }
 
+void task50ms(void)
+{
+    /* reference only
+        typedef struct {
+            uint32_t color0;
+            uint32_t color1;
+            uint32_t durationMillis;
+            uint8_t flashes;
+            uint8_t current_color;    // always 0 (color0) or 1 (color1)
+            uint32_t nextChangeMillis;
+        } PixelFlashEvent_t;
 
+    */
+    //static PixelFlashEvent_t last_pe={NeoBlack, NeoBlack, 0, 0, NeoBlack, PIXEL_TRIG_NOW};
+    //static bool didAction=false;
+    uint32_t current_millis = millis();
+
+    //if (memcmp((const void *) &last_pe, (const void *) &pixelAction, sizeof(PixelFlashEvent_t)) != 0) {
+    //    dump_pixelAction("task50ms new pe: ", pixelAction);
+    //    last_pe = pixelAction;
+    //}
+
+    // can also pxl.setBrightness(50);  (before .show)
+
+    if (pixelAction.nextChangeMillis > 0 && pixelAction.nextChangeMillis <= current_millis  ) {
+        if (pixelAction.current_color == 0) {
+            pxl.setPixelColor(pixelAction.pixelSelect, pixelAction.color0);
+            pxl.show();
+            //debug_p("Sent color0 (");
+            //debug_p(pixelAction.color0);
+            //debug_pln(") to pixel");
+            pixelAction.nextChangeMillis = millis() + (pixelAction.durationMillis / 2);
+            pixelAction.current_color = 1;
+
+        } else if (pixelAction.current_color == 1) {
+            pxl.setPixelColor(pixelAction.pixelSelect, pixelAction.color1);
+            pxl.show();
+            //debug_p("Sent color1 (");
+            //debug_p(pixelAction.color1);
+            //debug_pln(") to pixel");
+            pixelAction.nextChangeMillis = millis() + (pixelAction.durationMillis / 2);
+            pixelAction.current_color = 0 ;
+            // pixelAction.flashes = pixelAction.flashes - 1;
+            pixelAction.flashes -= 1;
+
+        }
+    }
+    if (pixelAction.flashes == 0) {
+        pixelAction.nextChangeMillis = 0;
+    }
+}
+
+
+//-------------------- STARTUP / SETUP  --------------------
+void setup() {
+  int potVal;
+
+  pinMode(NEOPIXEL_PIN, OUTPUT);
+  setPixelOuts(pixelExternal, NeoGreen, bright_state);
+  setPixelOuts(pixelButton, NeoWhite, bright_state);
+  pinMode(PIR_IN_PIN, INPUT);
+
+  Serial.begin(115200);
+  delay(1500);  // // 400 required for ESP8266 "D1 Mini Pro"
+
+  Serial.println("Cat Deterrent\n");
+  Serial.print("Maximum deflection readings: raw:");
+  potVal = analogRead(POT_IN_PIN);
+  Serial.print(potVal);
+  Serial.print(", Mapped degrees:");
+  sweepMaxPos = map(potVal, 0, 1023, 0, 179);
+  Serial.println(sweepMaxPos);
+
+  spraySweep.attach(SERVO_PIN,500,2400);
+
+  litButton.begin();
+  litButton.onPressed(onLitButtonPressShortRelease);
+  litButton.onPressedFor(2000, onLitButtonPressLongRelease);
+
+  //pixelAction = {color0, color1, duration, pixelExternal, flashes, NeoBlack, PIXEL_TRIG_NOW};
+
+}
+
+
+//-------------------- ACTION LOOP --------------------
 void loop() {
-
+  uint32_t sysTick = millis();
   int noMotion = digitalRead(PIR_IN_PIN);  //  Low True
 
+  // Serial.println("Loop!");
+
+  if(sysTick - tick50 > 50){
+    tick50 = sysTick;
+    task50ms();
+  }
+
+  // ----- Button / user interaction Handling ------
+  litButton.read();
+
+
+  // ----- Beast detection and response Handling ------
   if (! noMotion) {
     sweep(2);
   }
@@ -158,58 +287,4 @@ void loop() {
  //
   // waits for the servo to get there
 
-  //delay(15);
-  //Serial.println(bright_state);
-  //for (pos = 0; pos <= 180; pos += 1) {  // goes from 0 degrees to 180 degrees
-  //  // in steps of 1 degree
-  //  spraySweep.write(pos);  // tell servo to go to position in variable 'pos'
-  //  delay(15);           // waits 15ms for the servo to reach the position
-  //}
-  //for (pos = 180; pos >= 0; pos -= 1) {  // goes from 180 degrees to 0 degrees
-  //  spraySweep.write(pos);                  // tell servo to go to position in variable 'pos'
-  //  delay(15);                           // waits 15ms for the servo to reach the position
-  //}
-
-
-  Serial.println("Loop!");
-//  digitalWrite(RGB_BUILTIN, HIGH);   // Turn the RGB LED white
-//  delay(STEP_DELAY);
-//  neopixelWrite(RGB_BUILTIN,bright_state,bright_state,bright_state);
-
-
-
-  //setPixelOuts(NeoWhite, bright_state);
-  //
-  //delay(STEP_DELAY);
-  //
-  //Serial.println("OFF");
-  ////digitalWrite(RGB_BUILTIN, LOW);    // Turn the RGB LED off
-  //delay(STEP_DELAY);
-  //
-  //Serial.print("RED ");
-  ////neopixelWrite(RGB_BUILTIN,bright_state,0,0); // Red
-  //setPixelOuts(NeoRed, bright_state);
-  //delay(STEP_DELAY);
-  //
-  //Serial.println("GREEN");
-  ////neopixelWrite(RGB_BUILTIN,0,bright_state,0); // Green
-  //setPixelOuts(NeoGreen, bright_state);
-  //delay(STEP_DELAY);
-  //
-  //Serial.println("BLUE");
-  ////neopixelWrite(RGB_BUILTIN,0,0,bright_state); // Blue
-  //setPixelOuts(NeoBlue, bright_state);
-  //delay(STEP_DELAY);
-  //
-  //Serial.println("OFF");
-  ////neopixelWrite(RGB_BUILTIN,0,0,0); // Off / black
-  //setPixelOuts(NeoBlack, bright_state);
-  //
-  //// Toggle Brightness
-  //bright_state = (bright_state == RGB_BRIGHTNESS) ? RGB_FULL_BRIGHTNESS: RGB_BRIGHTNESS;
-  //Serial.print("\ncurrent bright_state: ");
-  //Serial.println(bright_state);
-  //
-  //delay(STEP_DELAY);
-  //
 }
