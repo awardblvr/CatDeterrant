@@ -70,7 +70,7 @@ Servo spraySweep;
 
 int16_t sweepMaxPos=0;    // 2-bytes
 int intraStepDelayMillis = 0;
-int servoStep = 2;
+int servoStep = 3;
 
 //-------------------- NEOPIXEL SUPPORT --------------------
 #define PIXELS_IN_USE 2
@@ -128,14 +128,13 @@ uint8_t  bright_state = 64;
 
 //-------------------- RUNTINE VARIABLES --------------------
 
-static uint32_t tick50=0, tick1000=0, tick10000=0;  // future:, tick128=0, tick30000=0;
+//static uint32_t tick50=0, tick1000=0, tick10000=0;  // future:, tick128=0, tick30000=0;
 bool squirtOK = true;
-uint32_t timeoutDurationMillis=0;   // inactivity duration timeout
+//uint32_t timeoutDurationMillis=0;   // inactivity duration timeout
 uint32_t nextTimeout=0;
 int16_t currentSweepPass=0;
 int16_t sweepPasses=0;            // Updated from EE @ startup
 int16_t calibrateSweepPasses=0;
-int16_t currentSweep;
 bool motionDetectorCleared=true;
 enum _currentSweepPos { ZERO, FULL };
 enum _currentSweepPos currentSweepPos = ZERO;
@@ -251,10 +250,10 @@ void sweepTask(void)
         currentSweepPassLocal = &calibrateSweepPasses;
     }
 
-    debug_printf("currentSweepPassLocal = %d", *currentSweepPassLocal);
+    debug_printf("Begin Task: currentSweepPassLocal = %d\n", *currentSweepPassLocal);
 
     if (currentSweepPos == ZERO) {
-        debug_printf("\nsweep Left: ");
+        debug_printf("sweep Left (currentSweepPassLocal:%d)\n", *currentSweepPassLocal);
         for (curPos=startPos; curPos < endPos; curPos += servoStep) {
             //Serial.print(curPos);
             //Serial.print(" ");
@@ -263,7 +262,7 @@ void sweepTask(void)
         }
         currentSweepPos = FULL;
     } else {
-        debug_printf("\nsweep Right ");
+        debug_printf("sweep Right (currentSweepPassLocal:%d)\n", *currentSweepPassLocal);
         for (curPos=endPos; curPos > startPos; curPos -= servoStep) {
             //Serial.print(curPos);
             //Serial.print(" ");
@@ -271,17 +270,19 @@ void sweepTask(void)
             delay(intraStepDelayMillis);
         }
         currentSweepPos = ZERO;
-        debug_printf("Decrementing *currentSweepPassLocal (%d) to", *currentSweepPassLocal);
+        debug_printf("Decrementing *currentSweepPassLocal (%d) to ", *currentSweepPassLocal);
         *currentSweepPassLocal -= 1;
         debug_printf("%d\n", *currentSweepPassLocal);
     }
 
-    if (*currentSweepPassLocal <= 0) {
-        debug_printf("currentSweepPassLocal ZERO, returning to RUN\n");
+    if (currentSweepPos == FULL && *currentSweepPassLocal >= 0) {
+        debug_printf("currentSweepPassLocal ZERO (%d) & Homed (%d), returning to RUN\n", *currentSweepPassLocal, currentSweepPos);
         digitalWrite(SQUIRT_PIN, LOW); // Turn OFF water Spray
         mode = RUN;
         // KILL current sweep task   ;
     } else {
+        debug_printf("currentSweepPassLocal (%d) NOT zero / homed (%d).. Sweep again\n", *currentSweepPassLocal, currentSweepPos );
+        taskManager.cancelTask(sweepTaskId);
         sweepTaskId = taskManager.execute(sweepTask);
     }
 }
@@ -366,143 +367,7 @@ void ledTask(void)
 }
 
 
-void task50ms(void)
-{
-    /* reference only
-        typedef struct {
-            uint32_t color0;
-            uint32_t color1;
-            uint32_t durationMillis;
-            uint8_t flashes;
-            uint8_t current_color;    // always 0 (color0) or 1 (color1)
-            uint32_t nextChangeMillis;
-        } PixelFlashEvent_t;
-
-    */
-    //static PixelFlashEvent_t last_pe={NeoBlack, NeoBlack, 0, 0, NeoBlack, PIXEL_TRIG_NOW};
-    //static bool didAction=false;
-    uint32_t current_millis = millis();
-
-    //if (memcmp((const void *) &last_pe, (const void *) &pixelAction, sizeof(PixelFlashEvent_t)) != 0) {
-    //    dump_pixelAction("task50ms new pe: ", pixelAction);
-    //    last_pe = pixelAction;
-    //}
-
-    // can also pxl.setBrightness(50);  (before .show)
-
-    //if (pixelAction.nextChangeMillis > 0 && pixelAction.nextChangeMillis <= current_millis  ) {
-    //    if (pixelAction.current_color == 0) {
-    //        pxl.setPixelColor(pixelAction.pixelSelect, pixelAction.color0);
-    //        pxl.show();
-    //        //debug_p("Sent color0 (");
-    //        //debug_p(pixelAction.color0);
-    //        //debug_pln(") to pixel");
-    //        pixelAction.nextChangeMillis = millis() + (pixelAction.durationMillis / 2);
-    //        pixelAction.current_color = 1;
-    //
-    //    } else if (pixelAction.current_color == 1) {
-    //        pxl.setPixelColor(pixelAction.pixelSelect, pixelAction.color1);
-    //        pxl.show();
-    //        //debug_p("Sent color1 (");
-    //        //debug_p(pixelAction.color1);
-    //        //debug_pln(") to pixel");
-    //        pixelAction.nextChangeMillis = millis() + (pixelAction.durationMillis / 2);
-    //        pixelAction.current_color = 0 ;
-    //        // pixelAction.flashes = pixelAction.flashes - 1;
-    //        pixelAction.flashes -= 1;
-    //
-    //    }
-    //}
-    //if (pixelAction.flashes == 0) {
-    //    pixelAction.nextChangeMillis = 0;
-    //}
-}
-
-void task1s(void)
-{
-}
-
-void task10s(void)
-{
-//    int x;
-//    updateBatteryDisplay();
-//
-//    if (!crashCheckDone) {
-//        crashCheckDone=true;
-//        uint8_t ee_last_boot_behavior = EEPROM.read(EE_LAST_BOOT_BEHAVIOR_ADDR);
-//        if (ee_last_boot_behavior == EE_LAST_BOOT_BEHAVIOR_CRASH) {
-//            EEPROM.write(EE_LAST_BOOT_BEHAVIOR_ADDR, EE_LAST_BOOT_BEHAVIOR_OK);
-//            EEPROM.commit();
-//            debug_pln("Updated EEPROM to EE_LAST_BOOT_BEHAVIOR_OK");
-//        }
-//    }
-//
-//    //debug_p("task10s.. Begin: avgRightTouchLong.getCount():");
-//    //debug_p(avgRightTouchLong.getCount());
-//    //debug_p(", avgRightTouch.getCount():");
-//    //debug_pln(avgRightTouch.getCount());
-//
-//    // Do touch averaging
-//    if (longTermAvgRightTouch == 0) {
-//        x = avgRightTouch.getAvg();
-//        avgRightTouchLong.reading(x);
-//        longTermAvgRightTouch = avgRightTouchLong.getAvg();
-//    //}else if (!isBeingTouched) {
-//    //    x = avgRightTouch.getAvg();
-//    //    avgRightTouchLong.reading(x);
-//    //    longTermAvgRightTouch = avgRightTouchLong.getAvg();
-//    //}
-//    }else {
-//        x = avgRightTouch.getAvg();
-//        avgRightTouchLong.reading(x);
-//        longTermAvgRightTouch = avgRightTouchLong.getAvg();
-//    }
-//    //debug_p("task10s.. END: avgRightTouchLong.getCount():");
-//    //debug_p(avgRightTouchLong.getCount());
-//    //debug_p(", avgRightTouch.getCount():");
-//    //debug_pln(avgRightTouch.getCount());
-//
-//    // Relocate display after 1 minute
-//    if ( (! relocateStatusLineDone) && (millis() > AUTO_RELOCATE_STATUS_MS)) {
-//        relocate_updateStatusLineDisplay();
-//        clearMyIPaddressLine();
-//        relocateStatusLineDone = true;
-//    }
-}
-
-
-
 //-------------------- INITIALIZATION SUPPORT  --------------------
-void writeLongIntoEEPROM(int address, long number)
-{
-    EEPROM.write(address, (number >> 24) & 0xFF);
-    EEPROM.write(address + 1, (number >> 16) & 0xFF);
-    EEPROM.write(address + 2, (number >> 8) & 0xFF);
-    EEPROM.write(address + 3, number & 0xFF);
-}
-
-
-long readLongFromEEPROM(int address)
-{
-    return ((long)EEPROM.read(address) << 24) +
-           ((long)EEPROM.read(address + 1) << 16) +
-           ((long)EEPROM.read(address + 2) << 8) +
-           (long)EEPROM.read(address + 3);
-}
-
-void writeInt16IntoEEPROM(int address, uint16_t number)
-{
-    EEPROM.write(address, (number >> 8) & 0xFF);
-    EEPROM.write(address + 1, number & 0xFF);
-}
-
-
-uint16_t readInt16FromEEPROM(int address)
-{
-    return  ((uint16_t)EEPROM.read(address) << 8) +
-            ((uint16_t)EEPROM.read(address + 1));
-}
-
 /*
  * initialization() Read/Write EEPROM values as needed:
  *
@@ -610,12 +475,12 @@ void initialization()
 //-------------------- STARTUP / SETUP  --------------------
 void setup() {
   //int potVal;
-
+  delay(1000);
   // Remember to set your serial monitor to 74880 baud
   // This odd speed will show ESP8266 boot diagnostics too
   Serial.begin(74880);
   //Serial.begin(115200);
-  delay(400);  // // 400 required for ESP8266 "D1 Mini Pro"
+  delay(800);  // // 400 required for ESP8266 "D1 Mini Pro"
   debug_printf("\n\n");
   delay(100);
   debug_printf("Cat Deterrent\n");
@@ -638,6 +503,12 @@ void setup() {
   debug_printf("Current default passes: %d\n", sweepPasses);
 
   spraySweep.attach(SERVO_PIN,500,2400);
+  spraySweep.write(0);
+  // max millis seems to be 3800 for the PIR to settle and say no motion
+  do {
+      delay(100);
+  } while(!digitalRead(PIR_IN_PIN) && millis() < 6000);
+  debug_printf("1st read of motion det: %s (millis = %ld)\n", digitalRead(PIR_IN_PIN) ? "Its Still": "MOTION", millis() );  //  Low True
 
   litButton.begin();
   litButton.onPressed(onLitButtonPressShortRelease);
@@ -680,6 +551,8 @@ void loop() {
       motionDetectorCleared = true;
   }
 
+  // ToDo:  bug... First pass through we get a detection and SQUIRT... Not sure why.
+
   switch (mode) {
       case RUN:
         if (mode != previousMode) {
@@ -688,12 +561,14 @@ void loop() {
             pixelAction[pixelExternal] = {NeoGreen, NeoBlack, PIXEL_FOREVER, NeoBlack};
             ledTaskId = taskManager.scheduleFixedRate(1000, ledTask);
             previousMode = mode;
+            break;
         }
 
         // ----- Beast detection and response Handling ------
         if (motionDetectorCleared && ! noMotion && currentSweepPass <= 0) {
-            debug_printf("MOTION! & currentSweepPass:%d\n", currentSweepPass);
-          sweepTaskId = taskManager.execute(sweepTask);
+            debug_printf("\nMOTION! & currentSweepPass:%d\n", currentSweepPass);
+            currentSweepPass = sweepPasses;
+            sweepTaskId = taskManager.execute(sweepTask);
         }
         break;
 
