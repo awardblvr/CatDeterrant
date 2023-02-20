@@ -135,7 +135,13 @@ uint32_t nextTimeout=0;
 int16_t currentSweepPass=0;
 int16_t sweepPasses=0;            // Updated from EE @ startup
 int16_t calibrateSweepPasses=0;
-bool motionDetectorCleared=true;
+#define MOTION_LOCKOUT_MILLIS  4000
+#define CALIBRATION_TIMEOUT_MILLIS  5000
+#define CALIBRATION_MAX_PASSES  50
+uint32_t nextDebugStatus = 0;
+bool detectorHoldoff=false;
+uint8_t realMotion=0;
+
 enum _currentSweepPos { ZERO, FULL };
 enum _currentSweepPos currentSweepPos = ZERO;
 enum _mode { RUN, BEGIN_CALIBRATE_SWEEP, CALIBRATE_SWEEP, CALIBRATE_PASSES };
@@ -144,11 +150,14 @@ enum _mode previousMode = (enum _mode) 0xFF;
 
 taskid_t ledTaskId;
 taskid_t sweepTaskId;
-taskid_t calibrateTaskId;
-
+taskid_t calibrateTimeoutTaskId;
+uint32_t calibrateTimeoutNextMillis=0;
+taskid_t motionLockoutTaskId;  // not used, but could be
+#define DELETE_TASK_WHEN_DONE true
 
 
 //-------------------- FORWARD DECLARATIONS --------------------
+void initialization(void);
 
 
 
@@ -161,26 +170,27 @@ void onLitButtonPressShortRelease(void)
     case RUN:
         mode = CALIBRATE_SWEEP;
         debug_printf("RUN--->CALIBRATESWEEP\n");
-        //pixelAction[pixelButton] = {NeoRed, NeoBlack, PIXEL_FOREVER, NeoBlack};
-        //pixelAction[pixelExternal] = {NeoOrange, NeoOrange, PIXEL_FOREVER, NeoBlack};
-        //ledTaskId = taskManager.scheduleFixedRate(300, ledTask);
-        calibrateSweepPasses = 20;
-        // WAS WORKING sweepTaskId = taskManager.execute(sweepTask);
-        //taskManager.execute(ledTask, [deleteWhenDone=false]);
-        //taskManager.execute(ledTask);
+        calibrateTimeoutNextMillis = millis() + CALIBRATION_TIMEOUT_MILLIS + 500;
+        calibrateTimeoutTaskId = taskManager.scheduleOnce(CALIBRATION_TIMEOUT_MILLIS, calibrationTimeoutTask, TIME_MILLIS);
+        debug_printf("CALIBRATESWEEP (initial CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
+        calibrateSweepPasses = CALIBRATION_MAX_PASSES;
         break;
 
     case CALIBRATE_SWEEP:
         debug_printf("EXITING CALIBRATESWEEP... Save Sweep value in EEPROM then RUN \n");
+        calibrateTimeoutNextMillis = 0;
         EE_init_mode = FORCE_SWEEP_MAX_POS;
         initialization();
-
-        //taskManager.cancelTask(ledTaskId);
-        //pixelAction[pixelButton] = {NeoRed, NeoBlack, PIXEL_FOREVER, NeoBlack};
-        //pixelAction[pixelExternal] = {NeoOrange, NeoOrange, PIXEL_FOREVER, NeoBlack};
-        //ledTaskId = taskManager.scheduleFixedRate(300, ledTask);
+        calibrateSweepPasses = 0;
+        currentSweepPass = 0;
+        realMotion=0;
+        taskManager.scheduleOnce(MOTION_LOCKOUT_MILLIS, detectorEnablerTask, TIME_MILLIS);
+        if (sweepTaskId) {
+            taskManager.cancelTask(sweepTaskId);
+            sweepTaskId = 0;
+        }
+        reHome();
         mode = RUN;
-
         break;
 
     case BEGIN_CALIBRATE_SWEEP:
@@ -191,11 +201,8 @@ void onLitButtonPressShortRelease(void)
     case CALIBRATE_PASSES:
         break;
 
-    //default:
     }
-
-  //lastActionMillis = millis();
-
+    debug_printf("EXITING bottom of actual onLitButtonPressShortRelease()\n");
 }
 
 void onLitButtonPressLongRelease(void)
@@ -231,6 +238,46 @@ void setPixelOuts(int pixelID, uint32_t colorVar, int brightVar)
   pxl.show();
 }
 
+void detectorEnablerTask(void)
+{
+    debug_printf("RE-ENABLING DETECTION\n");
+    detectorHoldoff = false;
+
+}
+
+void reHome(void)
+{
+    int startPos=0, endPos=sweepMaxPos;
+    int curPos, potVal;
+
+    for (curPos=endPos; curPos > startPos; curPos -= servoStep) {
+        spraySweep.write(curPos);
+    }
+    currentSweepPos = ZERO;
+}
+
+
+void calibrationTimeoutTask(void)
+{
+    debug_printf("CALIBRATION TIMEOUT, no values saved in EEPROM, returning to run mode\n");
+    calibrateSweepPasses = 0;
+    currentSweepPass = 0;
+    detectorHoldoff = true;
+    realMotion=0;
+    if (sweepTaskId) {
+        taskManager.cancelTask(sweepTaskId);
+        sweepTaskId = 0;
+    }
+
+    reHome();
+    taskManager.scheduleOnce(MOTION_LOCKOUT_MILLIS, detectorEnablerTask, TIME_MILLIS);
+    mode = RUN;
+    taskManager.cancelTask(calibrateTimeoutTaskId);
+
+}
+
+int lastCalibrateSweepMaxPos = 0;
+
 void sweepTask(void)
 {
     int startPos=0, endPos=sweepMaxPos;
@@ -238,22 +285,38 @@ void sweepTask(void)
 
     int16_t *currentSweepPassLocal = &currentSweepPass;
 
-
     if (squirtOK & mode == RUN) {
         debug_printf("SQUIRT\n");
         digitalWrite(SQUIRT_PIN, HIGH);
     } else if (mode == CALIBRATE_SWEEP) {
-        debug_printf("CALIBRATE_SWEEP\n");
+        currentSweepPassLocal = &calibrateSweepPasses;
         potVal = analogRead(POT_IN_PIN);
         sweepMaxPos = map(potVal, 0, 1023, 0, 179);
+
+        float diffVal = sweepMaxPos - lastCalibrateSweepMaxPos;  //      motorSpeedPotVal-lastMotorSpeedPotVal;
+        float percentChange = (diffVal/lastCalibrateSweepMaxPos) * 100.0;
+        debug_printf("CALIBRATION SWEEP #%d of %d position %% change: %f (CTTId: %d)\n",
+                     *currentSweepPassLocal, CALIBRATION_MAX_PASSES, percentChange, (uint32_t) calibrateTimeoutTaskId);
+        if ( abs(percentChange) > 3.0 ) {
+            debug_printf("    CS: new pot val maps to %d\n", sweepMaxPos);
+            lastCalibrateSweepMaxPos = sweepMaxPos;
+            calibrateTimeoutNextMillis = millis() + CALIBRATION_TIMEOUT_MILLIS + 500;
+            if (calibrateTimeoutTaskId) {
+                debug_printf("    CS: Kill old calibrateTimeoutTask (CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
+                taskManager.cancelTask(calibrateTimeoutTaskId);
+            }
+            calibrateTimeoutTaskId = taskManager.scheduleOnce(CALIBRATION_TIMEOUT_MILLIS, calibrationTimeoutTask, TIME_MILLIS);
+            debug_printf("    CS: NEW calibrateTimeoutTask (CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
+            calibrateSweepPasses = CALIBRATION_MAX_PASSES;
+
+        }
         endPos=sweepMaxPos;
-        currentSweepPassLocal = &calibrateSweepPasses;
     }
 
-    debug_printf("Begin Task: currentSweepPassLocal = %d\n", *currentSweepPassLocal);
+    //debug_printf("Begin Task: currentSweepPassLocal = %d\n", *currentSweepPassLocal);
 
     if (currentSweepPos == ZERO) {
-        debug_printf("sweep Left (currentSweepPassLocal:%d)\n", *currentSweepPassLocal);
+        //debug_printf("sweep Left (currentSweepPassLocal:%d)\n", *currentSweepPassLocal);
         for (curPos=startPos; curPos < endPos; curPos += servoStep) {
             //Serial.print(curPos);
             //Serial.print(" ");
@@ -262,7 +325,7 @@ void sweepTask(void)
         }
         currentSweepPos = FULL;
     } else {
-        debug_printf("sweep Right (currentSweepPassLocal:%d)\n", *currentSweepPassLocal);
+        //debug_printf("sweep Right (currentSweepPassLocal:%d)\n", *currentSweepPassLocal);
         for (curPos=endPos; curPos > startPos; curPos -= servoStep) {
             //Serial.print(curPos);
             //Serial.print(" ");
@@ -270,21 +333,51 @@ void sweepTask(void)
             delay(intraStepDelayMillis);
         }
         currentSweepPos = ZERO;
-        debug_printf("Decrementing *currentSweepPassLocal (%d) to ", *currentSweepPassLocal);
+        //debug_printf("Decrementing *currentSweepPassLocal (%d) to ", *currentSweepPassLocal);
         *currentSweepPassLocal -= 1;
-        debug_printf("%d\n", *currentSweepPassLocal);
+        //debug_printf("%d\n", *currentSweepPassLocal);
     }
 
-    if (currentSweepPos == FULL && *currentSweepPassLocal >= 0) {
+    if (*currentSweepPassLocal > 0) {
+        debug_printf("currentSweepPassLocal > 0 (%d) keep going\n", *currentSweepPassLocal, currentSweepPos);
+        //taskManager.cancelTask(sweepTaskId);
+        sweepTaskId = taskManager.execute(sweepTask);
+        debug_printf("return in sweepTask() after launching another instance sweepTask\n");
+        return;
+    }
+
+    if (currentSweepPos == ZERO) {
         debug_printf("currentSweepPassLocal ZERO (%d) & Homed (%d), returning to RUN\n", *currentSweepPassLocal, currentSweepPos);
         digitalWrite(SQUIRT_PIN, LOW); // Turn OFF water Spray
         mode = RUN;
+        taskManager.scheduleOnce(MOTION_LOCKOUT_MILLIS, detectorEnablerTask, TIME_MILLIS);
+        if (sweepTaskId) {
+            taskManager.cancelTask(sweepTaskId);
+            sweepTaskId = 0;
+        }
+
         // KILL current sweep task   ;
     } else {
-        debug_printf("currentSweepPassLocal (%d) NOT zero / homed (%d).. Sweep again\n", *currentSweepPassLocal, currentSweepPos );
-        taskManager.cancelTask(sweepTaskId);
-        sweepTaskId = taskManager.execute(sweepTask);
+        debug_printf("currentSweepPassLocal (%d) NOT zero / homed (%d).. (calibrateTimeoutTaskId:%d)... Sweep again \n",
+                     *currentSweepPassLocal, currentSweepPos, (uint32_t)calibrateTimeoutTaskId );
+        if (sweepTaskId) {
+            taskManager.cancelTask(sweepTaskId);
+            sweepTaskId = 0;
+        }
+
     }
+    //if (currentSweepPos == ZERO && *currentSweepPassLocal >= 0) {
+    //    debug_printf("currentSweepPassLocal ZERO (%d) & Homed (%d), returning to RUN\n", *currentSweepPassLocal, currentSweepPos);
+    //    digitalWrite(SQUIRT_PIN, LOW); // Turn OFF water Spray
+    //    mode = RUN;
+    //    // KILL current sweep task   ;
+    //} else {
+    //    debug_printf("currentSweepPassLocal (%d) NOT zero / homed (%d).. Sweep again\n", *currentSweepPassLocal, currentSweepPos );
+    //    taskManager.cancelTask(sweepTaskId);
+    //    sweepTaskId = taskManager.execute(sweepTask);
+    //}
+    debug_printf("EXITING bottom of actual sweepTask()\n");
+
 }
 
 
@@ -382,15 +475,15 @@ void ledTask(void)
  *  also... WEMOS D1 MINI Pro required setting board type to 'LOLIN(WEMOS) D1 Mini (clone)', NOT
  *  'LOLIN(WEMOS) D1 Mini pro' !!!
  */
-void initialization()
+void initialization(void)
 {
     uint8_t eeDebug=0;
     bool writtenFlag=false, uninitializedFlag=false;
     int16_t eeSweepMaxPos=0, eeSweepPasses=0;
     bool force_update_SweepMaxPos=false,
          force_update_SweepPasses=false;
-    
-    
+
+
     // EE_init_mode { NORMAL, FORCE_DEFAULTS, FORCE_SWEEP_MAX_POS, FORCE_SWEEP_PASSES, FORCE_ALL };
 
     EEPROM.begin(5);
@@ -399,12 +492,11 @@ void initialization()
     EEPROM.get(EE_ADDR_SWEEP_MAX_POS, eeSweepMaxPos);
     EEPROM.get(EE_ADDR_SWEEP_PASSES, eeSweepPasses);
 
+    debug_printf("initialization() (%s) initial reads: DEBUG_MODE:0x%X, SWEEP_MAX_POS:0x%X=%d, SWEEP_PASSES:0x%X=%d\n",
+             EE_init_mode_str[EE_init_mode],
+             eeDebug, eeSweepMaxPos, eeSweepMaxPos, eeSweepPasses, eeSweepPasses);
 
     // uninitialized eeproms are -1 (0xFFFF)
-    //if (eeSweepMaxPos == 0xFFFF ||  eeSweepPasses == 0xFFFF) {
-    //    uninitializedFlag = true;
-    //    EE_init_mode = FORCE_DEFAULTS;
-    //}
 
     switch (EE_init_mode) {
         case NORMAL:
@@ -415,7 +507,7 @@ void initialization()
             } else {
                 break;
             }
-            
+
         case  FORCE_DEFAULTS:
             eeSweepMaxPos = DEFAULT_SWEEP_MAX_POS;
             eeSweepPasses = DEFAULT_SWEEP_PASSES;
@@ -424,26 +516,26 @@ void initialization()
             break;
 
         case  FORCE_SWEEP_MAX_POS:
+            debug_printf("initialization(): FORCE_SWEEP_MAX_POS: value to write %d \n", sweepMaxPos);
             eeSweepMaxPos = sweepMaxPos;
             force_update_SweepMaxPos = true;
             break;
 
         case  FORCE_SWEEP_PASSES:
+            debug_printf("initialization(): FORCE_SWEEP_PASSES: value to write %d \n", sweepPasses);
+
             eeSweepPasses = sweepPasses;
             force_update_SweepPasses = true;
             break;
 
         case  FORCE_ALL:
+            debug_printf("initialization(): FORCE_ALL: value to write sweepMaxPos %d, sweepPasses %d\n", sweepMaxPos, sweepPasses);
             eeSweepMaxPos = sweepMaxPos;
             eeSweepPasses = sweepPasses;
             force_update_SweepMaxPos = true;
             force_update_SweepPasses = true;
             break;
     }
-
-    debug_printf("initialization() (%s) initial reads: DEBUG_MODE:0x%X, SWEEP_MAX_POS:0x%X=%d, SWEEP_PASSES:0x%X=%d\n",
-                 EE_init_mode_str[EE_init_mode],
-                 eeDebug, eeSweepMaxPos, eeSweepMaxPos, eeSweepPasses, eeSweepPasses);
 
     if (force_update_SweepMaxPos) {
         EEPROM.put(EE_ADDR_SWEEP_MAX_POS, eeSweepMaxPos);
@@ -466,9 +558,17 @@ void initialization()
 
         debug_printf("initialization() Completion w/ write SWEEP_MAX_POS:%d, SWEEP_PASSES:%d\n",
              sweepMaxPos, sweepPasses);
-
     }
     EEPROM.end();
+    if (writtenFlag) {
+        EEPROM.begin(5);
+        EEPROM.get(EE_ADDR_SWEEP_MAX_POS, eeSweepMaxPos);
+        EEPROM.get(EE_ADDR_SWEEP_PASSES, eeSweepPasses);
+        debug_printf("initialization() READ BACK after writing: SWEEP_MAX_POS:%d, SWEEP_PASSES:%d\n",
+                     eeSweepMaxPos, eeSweepPasses);
+        EEPROM.end();
+    }
+
     EE_init_mode = NORMAL;
 }
 
@@ -505,10 +605,10 @@ void setup() {
   spraySweep.attach(SERVO_PIN,500,2400);
   spraySweep.write(0);
   // max millis seems to be 3800 for the PIR to settle and say no motion
-  do {
-      delay(100);
-  } while(!digitalRead(PIR_IN_PIN) && millis() < 6000);
-  debug_printf("1st read of motion det: %s (millis = %ld)\n", digitalRead(PIR_IN_PIN) ? "Its Still": "MOTION", millis() );  //  Low True
+  //do {
+  //    delay(100);
+  //} while(!digitalRead(PIR_IN_PIN) && millis() < 6000);
+  debug_printf("1st read of motion det: %s (millis = %ld)\n", digitalRead(PIR_IN_PIN) ? "MOTION": "Its Still", millis() );  //  Low True
 
   litButton.begin();
   litButton.onPressed(onLitButtonPressShortRelease);
@@ -521,86 +621,69 @@ void setup() {
 
 //-------------------- ACTION LOOP --------------------
 void loop() {
-  uint32_t sysTick = millis();
-  int noMotion = digitalRead(PIR_IN_PIN);  //  Low True
+    uint32_t sysTick = millis();
+    int Motion = digitalRead(PIR_IN_PIN);
 
-  //  // ----- Button / user interaction Handling ------
-    litButton.read();
-  //
-    taskManager.runLoop();
-  //
-  //  // Serial.println("Loop!");
-  //
-  //  if(sysTick - tick50 > 50){
-  //    tick50 = sysTick;
-  //    task50ms();
-  //  }
-  //
-  //  if(sysTick - tick1000 > 1000){
-  //      tick1000 = sysTick;
-  //      task1s();
-  //  }
-  //
-  //  if(sysTick - tick10000 > 10000){
-  //      tick10000 = sysTick;
-  //      task10s();
-  //  }
-  //
+    if (detectorHoldoff == false && Motion) {
+        realMotion += 1;
+    } else {
+        realMotion = 0;
+    }
 
-  if (noMotion && !motionDetectorCleared){
-      motionDetectorCleared = true;
-  }
+    // ----- Button / user interaction Handling ------
+      litButton.read();
+      taskManager.runLoop();
 
-  // ToDo:  bug... First pass through we get a detection and SQUIRT... Not sure why.
+    // ToDo:  bug... First pass through we get a detection and SQUIRT... Not sure why.
 
-  switch (mode) {
-      case RUN:
-        if (mode != previousMode) {
-            debug_printf("Mode change %d --> RUN\n");
-            pixelAction[pixelButton] =   {NeoDarkPurple, NeoDarkPurple, PIXEL_FOREVER, NeoBlack};
-            pixelAction[pixelExternal] = {NeoGreen, NeoBlack, PIXEL_FOREVER, NeoBlack};
-            ledTaskId = taskManager.scheduleFixedRate(1000, ledTask);
-            previousMode = mode;
+    if (calibrateTimeoutNextMillis && calibrateTimeoutNextMillis < sysTick) {
+        debug_printf("-------------MANUALLY CALLING calibrationTimeoutTask()---------------\n");
+        calibrateTimeoutNextMillis = 0;
+        calibrationTimeoutTask();
+    }
+
+    switch (mode) {
+        case RUN:
+            if (mode != previousMode) {
+                debug_printf("Mode change %d --> RUN\n");
+                pixelAction[pixelButton] =   {NeoDarkPurple, NeoDarkPurple, PIXEL_FOREVER, NeoBlack};
+                pixelAction[pixelExternal] = {NeoGreen, NeoBlack, PIXEL_FOREVER, NeoBlack};
+                taskManager.cancelTask(ledTaskId);
+                ledTaskId = taskManager.scheduleFixedRate(1000, ledTask);
+                previousMode = mode;
+                break;
+            }
+
+            // ----- Beast detection and response Handling ------
+            if ( (realMotion > 5) && currentSweepPass <= 0) {
+                debug_printf("\nMOTION! & currentSweepPass:%d (will set to %d)\n", currentSweepPass, sweepPasses);
+                currentSweepPass = sweepPasses ;
+                nextDebugStatus = 0;
+                realMotion = 0;
+                detectorHoldoff = true;
+                sweepTaskId = taskManager.execute(sweepTask);
+                debug_printf("loop() returned from exec.sweepTask\n");
+            } else {
+                if (nextDebugStatus < millis()) {
+                    debug_printf(" detectorHoldoff %s, realMotion %d,  %d, currentSweepPass %d \n",
+                                 detectorHoldoff ? "HOLD OFF": "GoodToGo", realMotion, currentSweepPass);
+                    nextDebugStatus = millis() + 2000;
+                }
+            }
             break;
-        }
 
-        // ----- Beast detection and response Handling ------
-        if (motionDetectorCleared && ! noMotion && currentSweepPass <= 0) {
-            debug_printf("\nMOTION! & currentSweepPass:%d\n", currentSweepPass);
-            currentSweepPass = sweepPasses;
-            sweepTaskId = taskManager.execute(sweepTask);
-        }
-        break;
+        case CALIBRATE_SWEEP:
+          if (mode != previousMode) {
+              debug_printf("Mode change %d --> CALIBRATE_SWEEP\n", mode);
+              taskManager.cancelTask(ledTaskId);
+              pixelAction[pixelButton] = {NeoRed, NeoBlack, PIXEL_FOREVER, NeoBlack};
+              pixelAction[pixelExternal] = {NeoOrange, NeoOrange, PIXEL_FOREVER, NeoBlack};
+              ledTaskId = taskManager.scheduleFixedRate(300, ledTask);
+              previousMode = mode;
 
-      case CALIBRATE_SWEEP:
-        if (mode != previousMode) {
-            debug_printf("Mode change %d --> CALIBRATE_SWEEP\n");
-            taskManager.cancelTask(ledTaskId);
-            pixelAction[pixelButton] = {NeoRed, NeoBlack, PIXEL_FOREVER, NeoBlack};
-            pixelAction[pixelExternal] = {NeoOrange, NeoOrange, PIXEL_FOREVER, NeoBlack};
-            ledTaskId = taskManager.scheduleFixedRate(300, ledTask);
-            previousMode = mode;
-
-            sweepTaskId = taskManager.execute(sweepTask);
-        }
-        break;
-
-  }
-
- // int pos, val;
- //
- // // reads the value of the potentiometer (0 to 1023)
- //
- // val = analogRead(POT_IN_PIN);
- //
- //// scale it to use it with the servo (0 to 180)
- //
- // val = map(val, 0, 1023, 0, 179);
- //
- // // sets servo position according to the scaled value
- //
- // spraySweep.write(val);
- //
-  // waits for the servo to get there
-
+              sweepTaskId = taskManager.execute(sweepTask);
+              debug_printf("loop() returned from CALIBRATE exec.sweepTask\n");
+          }
+          break;
+    }
 }
