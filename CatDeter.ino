@@ -62,6 +62,13 @@ enum _EE_init_mode { NORMAL=0, FORCE_DEFAULTS, FORCE_SWEEP_MAX_POS, FORCE_SWEEP_
 const char *EE_init_mode_str[] = {"NORMAL","FORCE_DEFAULTS","FORCE_SWEEP_MAX_POS","FORCE_SWEEP_PASSES","FORCE_ALL"};
 enum _EE_init_mode EE_init_mode = NORMAL;
 
+typedef struct {
+    uint8_t     debugMode;
+    uint16_t    sweepMaxPos;
+    uint16_t    sweepPasses;
+} eeVals_t;
+eeVals_t eeVals;
+
 //-------------------- BUTTON SUPPORT --------------------
 EasyButton litButton(BUTTON_IN_PIN);
 
@@ -150,7 +157,8 @@ enum _mode previousMode = (enum _mode) 0xFF;
 
 taskid_t ledTaskId;
 taskid_t sweepTaskId;
-taskid_t calibrateTimeoutTaskId;
+taskid_t detectorEnablerTaskId;
+//-taskid_t calibrateTimeoutTaskId;
 uint32_t calibrateTimeoutNextMillis=0;
 taskid_t motionLockoutTaskId;  // not used, but could be
 #define DELETE_TASK_WHEN_DONE true
@@ -171,8 +179,8 @@ void onLitButtonPressShortRelease(void)
         mode = CALIBRATE_SWEEP;
         debug_printf("RUN--->CALIBRATESWEEP\n");
         calibrateTimeoutNextMillis = millis() + CALIBRATION_TIMEOUT_MILLIS + 500;
-        calibrateTimeoutTaskId = taskManager.scheduleOnce(CALIBRATION_TIMEOUT_MILLIS, calibrationTimeoutTask, TIME_MILLIS);
-        debug_printf("CALIBRATESWEEP (initial CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
+        //-calibrateTimeoutTaskId = taskManager.scheduleOnce(CALIBRATION_TIMEOUT_MILLIS, calibrationTimeoutTask, TIME_MILLIS);
+        //-debug_printf("CALIBRATESWEEP (initial CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
         calibrateSweepPasses = CALIBRATION_MAX_PASSES;
         break;
 
@@ -184,7 +192,14 @@ void onLitButtonPressShortRelease(void)
         calibrateSweepPasses = 0;
         currentSweepPass = 0;
         realMotion=0;
-        taskManager.scheduleOnce(MOTION_LOCKOUT_MILLIS, detectorEnablerTask, TIME_MILLIS);
+        if (detectorEnablerTaskId) {
+            debug_printf("onLitButtonPressShortRelease() SCHEDULING detectorEnablerTask after cancelling existing one!!\n");
+            taskManager.cancelTask(detectorEnablerTaskId);
+            detectorEnablerTaskId = 0;
+        } else {
+            debug_printf("onLitButtonPressShortRelease() SCHEDULING detectorEnablerTask\n");
+        }
+        detectorEnablerTaskId = taskManager.scheduleOnce(MOTION_LOCKOUT_MILLIS, detectorEnablerTask, TIME_MILLIS);
         if (sweepTaskId) {
             taskManager.cancelTask(sweepTaskId);
             sweepTaskId = 0;
@@ -243,6 +258,7 @@ void detectorEnablerTask(void)
     debug_printf("RE-ENABLING DETECTION\n");
     detectorHoldoff = false;
 
+
 }
 
 void reHome(void)
@@ -252,6 +268,7 @@ void reHome(void)
 
     for (curPos=endPos; curPos > startPos; curPos -= servoStep) {
         spraySweep.write(curPos);
+        delay(2);
     }
     currentSweepPos = ZERO;
 }
@@ -259,7 +276,12 @@ void reHome(void)
 
 void calibrationTimeoutTask(void)
 {
-    debug_printf("CALIBRATION TIMEOUT, no values saved in EEPROM, returning to run mode\n");
+    debug_printf("CALIBRATION TIMEOUT, no values saved in EEPROM , returning to run mode\n");
+    //debug_printf("keep existing values: sweepMaxPos:%d, sweepPasses:%d\n", sweepMaxPos, sweepPasses);
+    readCurrentEEvals(&eeVals);
+    debug_printf("keep existing values: sweepMaxPos:%d, sweepPasses:%d\n", eeVals.sweepMaxPos, eeVals.sweepPasses);
+
+
     calibrateSweepPasses = 0;
     currentSweepPass = 0;
     detectorHoldoff = true;
@@ -270,9 +292,17 @@ void calibrationTimeoutTask(void)
     }
 
     reHome();
+
+    if (detectorEnablerTaskId) {
+        debug_printf("calibrationTimeoutTask() SCHEDULING detectorEnablerTask after cancelling existing one!!\n");
+        taskManager.cancelTask(detectorEnablerTaskId);
+        detectorEnablerTaskId = 0;
+    } else {
+        debug_printf("calibrationTimeoutTask() SCHEDULING detectorEnablerTask\n");
+    }
     taskManager.scheduleOnce(MOTION_LOCKOUT_MILLIS, detectorEnablerTask, TIME_MILLIS);
     mode = RUN;
-    taskManager.cancelTask(calibrateTimeoutTaskId);
+    //- taskManager.cancelTask(calibrateTimeoutTaskId);
 
 }
 
@@ -295,22 +325,25 @@ void sweepTask(void)
 
         float diffVal = sweepMaxPos - lastCalibrateSweepMaxPos;  //      motorSpeedPotVal-lastMotorSpeedPotVal;
         float percentChange = (diffVal/lastCalibrateSweepMaxPos) * 100.0;
-        debug_printf("CALIBRATION SWEEP #%d of %d position %% change: %f (CTTId: %d)\n",
-                     *currentSweepPassLocal, CALIBRATION_MAX_PASSES, percentChange, (uint32_t) calibrateTimeoutTaskId);
+        //-debug_printf("CALIBRATION SWEEP #%d of %d position %% change: %f (CTTId: %d)\n",
+        //-             *currentSweepPassLocal, CALIBRATION_MAX_PASSES, percentChange, (uint32_t) calibrateTimeoutTaskId);
+        debug_printf("CALIBRATION SWEEP #%d of %d position %% change: %f\n",
+                     *currentSweepPassLocal, CALIBRATION_MAX_PASSES, percentChange);
         if ( abs(percentChange) > 3.0 ) {
             debug_printf("    CS: new pot val maps to %d\n", sweepMaxPos);
             lastCalibrateSweepMaxPos = sweepMaxPos;
             calibrateTimeoutNextMillis = millis() + CALIBRATION_TIMEOUT_MILLIS + 500;
-            if (calibrateTimeoutTaskId) {
-                debug_printf("    CS: Kill old calibrateTimeoutTask (CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
-                taskManager.cancelTask(calibrateTimeoutTaskId);
-            }
-            calibrateTimeoutTaskId = taskManager.scheduleOnce(CALIBRATION_TIMEOUT_MILLIS, calibrationTimeoutTask, TIME_MILLIS);
-            debug_printf("    CS: NEW calibrateTimeoutTask (CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
+            //-if (calibrateTimeoutTaskId) {
+            //-    debug_printf("    CS: Kill old calibrateTimeoutTask (CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
+            //-    taskManager.cancelTask(calibrateTimeoutTaskId);
+            //-}
+            //-calibrateTimeoutTaskId = taskManager.scheduleOnce(CALIBRATION_TIMEOUT_MILLIS, calibrationTimeoutTask, TIME_MILLIS);
+            //-debug_printf("    CS: NEW calibrateTimeoutTask (CTTId: %d)\n", (uint32_t)calibrateTimeoutTaskId);
             calibrateSweepPasses = CALIBRATION_MAX_PASSES;
 
         }
         endPos=sweepMaxPos;
+
     }
 
     //debug_printf("Begin Task: currentSweepPassLocal = %d\n", *currentSweepPassLocal);
@@ -350,6 +383,13 @@ void sweepTask(void)
         debug_printf("currentSweepPassLocal ZERO (%d) & Homed (%d), returning to RUN\n", *currentSweepPassLocal, currentSweepPos);
         digitalWrite(SQUIRT_PIN, LOW); // Turn OFF water Spray
         mode = RUN;
+        if (detectorEnablerTaskId) {
+            debug_printf("sweepTask() SCHEDULING detectorEnablerTask after cancelling existing one!!\n");
+            taskManager.cancelTask(detectorEnablerTaskId);
+            detectorEnablerTaskId = 0;
+        } else {
+            debug_printf("sweepTask() SCHEDULING detectorEnablerTask\n");
+        }
         taskManager.scheduleOnce(MOTION_LOCKOUT_MILLIS, detectorEnablerTask, TIME_MILLIS);
         if (sweepTaskId) {
             taskManager.cancelTask(sweepTaskId);
@@ -358,8 +398,10 @@ void sweepTask(void)
 
         // KILL current sweep task   ;
     } else {
-        debug_printf("currentSweepPassLocal (%d) NOT zero / homed (%d).. (calibrateTimeoutTaskId:%d)... Sweep again \n",
-                     *currentSweepPassLocal, currentSweepPos, (uint32_t)calibrateTimeoutTaskId );
+        //-debug_printf("currentSweepPassLocal (%d) NOT zero / homed (%d).. (calibrateTimeoutTaskId:%d)... Sweep again \n",
+        //-             *currentSweepPassLocal, currentSweepPos, (uint32_t)calibrateTimeoutTaskId );
+        debug_printf("currentSweepPassLocal (%d) NOT zero / homed (%d)... Sweep again \n",
+                     *currentSweepPassLocal, currentSweepPos);
         if (sweepTaskId) {
             taskManager.cancelTask(sweepTaskId);
             sweepTaskId = 0;
@@ -572,6 +614,17 @@ void initialization(void)
     EE_init_mode = NORMAL;
 }
 
+
+void readCurrentEEvals(eeVals_t *EE)
+{
+    EEPROM.begin(5);
+    EEPROM.get(EE_ADDR_DEBUG_MODE, EE->debugMode);
+    EEPROM.get(EE_ADDR_SWEEP_MAX_POS, EE->sweepMaxPos);
+    EEPROM.get(EE_ADDR_SWEEP_PASSES, EE->sweepPasses);
+    EEPROM.end();
+}
+
+
 //-------------------- STARTUP / SETUP  --------------------
 void setup() {
   //int potVal;
@@ -616,6 +669,9 @@ void setup() {
 
   //pixelAction = {color0, color1, duration, pixelExternal, flashes, NeoBlack, PIXEL_TRIG_NOW};
 
+  readCurrentEEvals(&eeVals);
+  debug_printf("setup(): existing values: sweepMaxPos:%d, sweepPasses:%d\n", eeVals.sweepMaxPos, eeVals.sweepPasses);
+
 }
 
 
@@ -626,7 +682,7 @@ void loop() {
 
     if (detectorHoldoff == false && Motion) {
         realMotion += 1;
-    } else {
+     } else {
         realMotion = 0;
     }
 
@@ -657,7 +713,7 @@ void loop() {
             // ----- Beast detection and response Handling ------
             if ( (realMotion > 5) && currentSweepPass <= 0) {
                 debug_printf("\nMOTION! & currentSweepPass:%d (will set to %d)\n", currentSweepPass, sweepPasses);
-                currentSweepPass = sweepPasses ;
+                currentSweepPass = sweepPasses;
                 nextDebugStatus = 0;
                 realMotion = 0;
                 detectorHoldoff = true;
@@ -665,7 +721,7 @@ void loop() {
                 debug_printf("loop() returned from exec.sweepTask\n");
             } else {
                 if (nextDebugStatus < millis()) {
-                    debug_printf(" detectorHoldoff %s, realMotion %d,  %d, currentSweepPass %d \n",
+                    debug_printf(" detectorHoldoff %s, realMotion %d, currentSweepPass %d \n",
                                  detectorHoldoff ? "HOLD OFF": "GoodToGo", realMotion, currentSweepPass);
                     nextDebugStatus = millis() + 2000;
                 }
